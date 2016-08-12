@@ -1,0 +1,428 @@
+#!/usr/bin/perl
+#
+# Import ISC BIND zonefiles into Netdot
+#
+use lib "<<Make:LIB>>";
+use Netdot::Model;
+use Net::DNS::ZoneFile::Fast;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use BIND::Config::Parser;
+use strict;
+use Data::Dumper;
+use Log::Log4perl::Level;
+
+use JSON::PP;
+use Net::DNS::ZoneFile::Fast;
+use Net::DNS::RR::SOA;
+use Net::IP;
+use Scalar::Util qw(looks_like_number reftype blessed);
+use JSON::PP;
+use List::MoreUtils qw(uniq);
+use Text::CSV;
+use IO::Handle;
+
+my $J = JSON::PP->new->ascii->pretty->allow_nonref;
+my %self;
+sub help {
+    print <<HELP;
+Usage: $0
+    -g,--debug          Debug output
+    -o [ import | remote ]
+                        Run on of supported operations: 
+                        * import: import/edit zone
+                        * remote: list zones with defined remotes
+
+    -S,--strict         Update only if zone exists, otherwise fail. Use only 
+                        exact match, no parent zone search.
+    -z,--zone ZONE_NAME
+    -d,-[-zone]-data FILE
+                        Zone data in bind format, or host/dig output
+    -w,--wipe           Delete all records
+    -u,--update_ptrs    Update PTRs for each imported A/AAAA
+    -q,-[-no]-quiet     Don'd output updated results
+    -f,--format [ csv | json ]
+                        Output format for remote op.
+
+* Zone meta data
+
+    -a,-[-no]-active
+    -d,--default-ttl TTL
+
+* SOA data overwite/definition
+
+    -m,--mname
+    -t,--rname
+    -s,--serial
+    -R,--refresh
+    -t,--retry
+    -e,--expire
+    -M,--minimum
+
+    --ignore-soa        Ignore SOA record from zone data
+
+* DNS server meta data. 
+  - Use '+' character as ADDR to remove ACL field
+  - Field is always overwritten, if specified and valid
+  - Old value is preserverd, when not specified
+
+--allow-transfer ADDR,ADDR,...
+--allow-query ADDR,ADDR,...
+--also-notify ADDR,ADDR,...
+--masters ADDR,ADDR,...
+
+* Examples:
+- list remote zones in CSV format
+    $0 -o remote -f csv
+- update MNAME
+    $0 -g -S -z testzone.net --mname ns1.example.com
+- remove all RR
+    $0 -g -S -z testzone.net --wipe
+- create/update zone from remote, with rewriten MNAME, RNAME and 
+  serial. no output requested
+    $0 -q -S -z testzone.net -d <(host -t AXFR testzone.net 6.6.6.6) \\
+    --serial 666 --mname ns1.example.com --rname hostmaster.o2bs.sk \\
+    --masters 1.0.0.1,2.0.0.2
+- disable zone
+    $0 -g -S -z testzone.net --no-active
+HELP
+};
+
+my ($zone_name, $zone_data_file, $ignore_soa);
+my $op = 'import';
+
+my $md = {};
+my $acl = {
+	also_notify => [],
+	allow_transfer => [],
+	allow_query => [],
+	masters => [],
+};
+
+my $options = GetOptions( 
+	'o|operation=s' => sub {
+		my $_op = $_[1];
+		die "Invalid operation: $_op\n"
+			unless grep {$_op eq $_} qw(import remote);
+		$op = $_op;
+	},
+    "u|update_ptrs"   => \$self{update_ptrs},
+    "w|wipe"          => \$self{wipe},
+    "h|help"          => \$self{help},
+    "g|debug"         => \$self{debug},
+	'S|strict' => \$self{strict},
+	'q|quiet!' => \$self{quiet},
+	'f|format=s' => sub {
+		die "Invalid operation: $_[1]\n"
+			unless grep {$_[1] eq $_} qw(json csv);
+		$self{format} = $_[1];
+	},
+
+	'z|zone=s' => \$zone_name,
+	'd|data|zone-data=s' => \$zone_data_file,
+
+	'm|mname=s' => \$md->{mname},
+	'r|rname=s' => \$md->{rname},
+	's|serial=i' => \$md->{serial},
+	'R|refresh=i' => \$md->{refresh},
+	'M|minimum=i' => \$md->{minimum},
+	't|retry=i' => \$md->{retry},
+	'e|expire=i' => \$md->{expire},
+
+	'a|active!' => \$md->{active},
+	'T|default-ttl=i' => \$md->{default_ttl},
+
+	'ignore-soa!' => \$ignore_soa,
+	'allow-transfer=s' => \@{$acl->{allow_transfer}},
+	'allow-query=s' => \@{$acl->{allow_query}},
+	'also-notify=s' => \@{$acl->{also_notify}},
+	'masters=s' => \@{$acl->{masters}},
+);
+
+# Add a log appender 
+my $logger = Netdot->log->get_logger('Netdot::Model::DNS');
+my $logscr = Netdot::Util::Log->new_appender('Screen', stderr=>0);
+$logger->add_appender($logscr);
+$logger->level($DEBUG) if ( $self{debug} ); # Notice that $DEBUG is imported from Log::Log4perl
+###
+
+help && exit 0
+	if $self{help};
+
+if ($op eq 'import') {
+	help && exit 1 
+		unless $options && $zone_name;
+
+	# join arrays of options and comman separated string of options into one array
+	for (keys %$acl) {
+		# $acl->{allow_transfer} = [ split(/,/,join(',',@{$acl->{allow_transfer}})) ];
+		$acl->{$_} = [ split(/,/,join(',',@{$acl->{$_}})) ];
+	}
+
+	# - zone_data: set of Net::DNS::RR
+	# - metadata: hash o RR::SOA values, to be later merged with command-line options
+	my ($metadata, $rrs);
+	if ($zone_data_file) {
+		($metadata, $rrs) = read_zone_data($zone_data_file);
+	}
+	else {
+		$metadata = &metadata_merge({}, $md);
+	}
+
+	# do the stuff.
+	my $zone = &zone_import($zone_name, $rrs, $metadata, $acl);
+
+	# report current state of zone on JSON
+	unless ($self{quiet}) {
+		$zone = Netdot::Model::Zone->search(name => $zone->name)->first;
+		die (sprintf("Request and result zones don't match: %s -> %s", $zone_name, $zone->name))
+			if $zone_name ne $zone->name;
+
+		my $res = { map { $_ => $zone->{$_} } grep { !/^_/ } keys %$zone };
+
+		eval {
+			my $info = $J->decode($res->{info});
+			$res->{info} = $info;
+		};
+
+		print $J->encode($res);
+		print $J->encode($zone->get_all_records);
+	}
+}
+elsif ($op eq 'remote') {
+	&search_remote_zones;
+}
+else {
+	warn "Invalid operation.\n";
+	help && exit 1;
+}
+
+exit 0;
+
+######################################################################
+
+sub zone_import {
+	my ($zone_name, $rrs, $metadata, $acl) = @_;
+	my $zones = Netdot::Model::Zone->search(name => $zone_name);
+
+	my $zone;
+
+	unless ($zones->count) {
+		# NOT FOUND -> CREATE
+		die "Domain not found"
+			if $self{strict};
+		# ZONE ADD
+		$zone = &zone_create($zone_name, $metadata);
+	}
+	else {
+		# FOUND -> UPDATE
+		# * strict -> match found && requested name
+		# * no-strict -> create new zone if there is no match
+		# to avoid this scenario:
+		#  DEBUG - Zone::search: asdf.testzone.sk
+		#  DEBUG - Zone::search: testzone.sk
+		#  DEBUG - Zone::search: found: testzone.sk
+		
+		# UPDATE OLD, but lets check first
+		$zone = $zones->first;
+
+		if ($zone_name ne $zone->name) {
+			die sprintf("Found only parent zone: %s.\n", $zone->name)
+				if $self{strict};
+
+			# CREATE NEW
+			$zone = &zone_create($zone_name, $metadata);
+		}
+	}
+
+
+	# dommy call, to fill-in internal hash from database
+	$zone->get('active');
+
+	# Zone::import cannot set info field
+	&zone_update_acl($zone, $acl)
+		if $acl;
+
+	&zone_update($zone, $metadata)
+		if $metadata;
+
+	if ($rrs || $self{wipe}) {
+		for ($zone->records) {
+			$logger->debug(sprintf('%s: Deleting RR label %s', $zone_name, $_->name));
+			$_->delete;
+		}
+
+		$zone->import_records(
+			rrs => $rrs, 
+			update_ptrs => $self{update_ptrs},
+			overwrite => undef, # this part is utterly broken on Netdots part
+		)
+			if $rrs;
+	}
+
+	return $zone;
+};
+
+sub zone_create {
+	my ($zone_name, $metadata) = @_;
+
+	my %data =
+		map { $_ => $metadata->{$_} } 
+		grep { defined $metadata->{$_} } 
+		qw(serial name expire rname mname refresh minimum active retry default_ttl);
+
+	# Zone->_encode_rname on instance.
+	$data{rname} =~ s/\@/./g
+		if $data{rname};
+
+	return Netdot::Model::Zone->insert({
+		name => $zone_name,
+		%data,
+	});
+};
+
+sub zone_update {
+	my ($zone, $new_data) = @_;
+
+	my $update = { %$zone, %$new_data };
+
+	# delete $update->{$_} 
+	#	for qw(contactlist id include name);
+
+	my %update = 
+		map { $_ => $update->{$_} } 
+		grep { defined $update->{$_} } 
+		qw(serial name expire rname mname refresh minimum active retry default_ttl);
+
+	# Zone->_encode_rname on instance.
+	$update{rname} =~ s/\@/./g
+		if $update{rname};
+
+	eval {
+		$update{info} = $J->encode($zone->{info})
+			if ref $zone->{info} && reftype($zone->{info}) eq 'HASH';
+	};
+
+	my $res = $zone->update({%update});
+	return $res;
+};
+
+sub zone_update_acl {
+	my ($zone, $acl) = @_;
+	my $old_acl = {};
+	
+	eval {
+		if (ref $zone->{info} && reftype($zone->{info}) eq 'HASH') {
+			$old_acl = $zone->{info};
+		}
+		else {
+			$old_acl = $J->decode($zone->{info});
+		}
+	};
+
+	for (keys %$acl) {
+		if (grep { $_ eq '+' } @{$acl->{$_}}) {
+			delete $old_acl->{$_};
+		}
+		elsif (@{$acl->{$_}} > 0) {
+			$old_acl->{$_} = [uniq(@{$acl->{$_}})];
+			for my $ip (@{$acl->{$_}}) {
+				Net::IP->new($ip) or die (Net::IP::Error());
+			}
+		}
+	}
+
+	# should be done in final save.
+	# $zone->{info} = $self->{j}->encode($old_acl);
+	# print Dumper($self->{j}->encode($old_acl));
+	return $zone->{info} = $old_acl;
+}
+
+sub zone_empty {
+	my $zone = shift;
+	for my $r ($zone->records) {
+		$r->delete;
+	}
+};
+
+sub read_zone_data {
+	my $filename = shift;
+
+	die "Cannot read zone file <$zone_data_file>."
+		unless -r $zone_data_file;
+
+	open(my $fhzd, '<', $zone_data_file);
+	my $zone_data;
+	{
+		local $/;
+		$zone_data = <$fhzd>;
+	};
+
+	my $zone_rrs = Net::DNS::ZoneFile::Fast::parse($zone_data);
+	my $soa;
+
+	unless ($ignore_soa) {
+		for (grep { blessed($_) eq 'Net::DNS::RR::SOA' } @$zone_rrs) {
+			$soa = $_;
+			last;
+		};
+	}
+
+	my $metadata;
+	if ($soa) {
+		$metadata = {
+			mname => $soa->mname,
+			rname => $soa->rname,
+			serial => $soa->serial,
+			refresh => $soa->refresh,
+			retry => $soa->retry,
+			expire => $soa->expire,
+			minimum => $soa->minimum, 
+		};
+		$metadata = metadata_merge($metadata, $md);
+	}
+	else {
+		$metadata = metadata_merge({}, $md);
+	}
+
+	return ($metadata, $zone_rrs);
+};
+
+sub metadata_merge {
+	my ($md1, $md2) = @_;
+	map { $md1->{$_} = $md2->{$_} } grep {  defined $md2->{$_} } keys %$md2;
+	return $md1;
+};
+
+sub search_remote_zones {
+	my @res = Netdot::Model::Zone->search_like(info => '%masters%');
+
+	my $remote_zones = {};
+
+	for my $z (@res) {
+		my $acl;
+		eval {
+			$acl = $J->decode($z->info);
+		};
+		if ($@) {
+			$logger->error('%s: Invalid ACL data', $z->name);
+			next;
+		}
+
+		$remote_zones->{$z->name} = $acl->{masters};
+	}
+
+	if ($self{format} eq 'json') {
+		print $J->encode($remote_zones);
+	}
+	else {
+		my $io = IO::Handle->new();
+		$io->fdopen(fileno(STDOUT),"w");
+		my $csv = Text::CSV->new({always_quote => 1});
+
+		local $\ = "\n";
+		for my $k (keys %$remote_zones) {
+			$csv->print($io, [$k, @{$remote_zones->{$k}}]);
+		}
+	}
+};
+
