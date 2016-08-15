@@ -4,7 +4,7 @@
 #
 use lib "<<Make:LIB>>";
 use Netdot::Model;
-use Net::DNS::ZoneFile::Fast;
+use Net::DNS::ZoneFile;
 use Getopt::Long qw(:config no_ignore_case bundling);
 use BIND::Config::Parser;
 use strict;
@@ -12,7 +12,6 @@ use Data::Dumper;
 use Log::Log4perl::Level;
 
 use JSON::PP;
-use Net::DNS::ZoneFile::Fast;
 use Net::DNS::RR::SOA;
 use Net::IP;
 use Scalar::Util qw(looks_like_number reftype blessed);
@@ -357,7 +356,7 @@ sub read_zone_data {
 		$zone_data = <$fhzd>;
 	};
 
-	my $zone_rrs = Net::DNS::ZoneFile::Fast::parse($zone_data);
+	my $zone_rrs = Net::DNS::ZoneFile->parse($zone_data);
 	my $soa;
 
 	unless ($ignore_soa) {
