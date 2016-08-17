@@ -78,7 +78,7 @@ Usage: $0
     $0 -g -S -z testzone.net --wipe
 - create/update zone from remote, with rewriten MNAME, RNAME and 
   serial. no output requested
-    $0 -q -S -z testzone.net -d <(host -t AXFR testzone.net 6.6.6.6) \\
+    $0 -q -S -z testzone.net -d <(dig AXFR testzone.net @6.6.6.6) \\
     --serial 666 --mname ns1.example.com --rname hostmaster.o2bs.sk \\
     --masters 1.0.0.1,2.0.0.2
 - disable zone
