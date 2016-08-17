@@ -58,6 +58,8 @@ Usage: $0
     -M,--minimum
 
     --ignore-soa        Ignore SOA record from zone data
+    --inc-serial        Increment serial by +1 (either in import, if 
+                        provided, or stored value)
 
 * DNS server meta data. 
   - Use '+' character as ADDR to remove ACL field
@@ -131,6 +133,10 @@ my $options = GetOptions(
 	'T|default-ttl=i' => \$md->{default_ttl},
 
 	'ignore-soa!' => \$ignore_soa,
+	'inc-serial' => sub {
+		# could be updated to +/- soem value in the future
+		$self{inc_serial} = 1;
+	},
 	'allow-transfer=s' => \@{$acl->{allow_transfer}},
 	'allow-query=s' => \@{$acl->{allow_query}},
 	'also-notify=s' => \@{$acl->{also_notify}},
@@ -240,6 +246,15 @@ sub zone_import {
 	# Zone::import cannot set info field
 	&zone_update_acl($zone, $acl)
 		if $acl;
+
+	if ($self{inc_serial}) {
+		if (defined $metadata->{serial}) {
+			$metadata->{serial}++;
+		}
+		else {
+			$metadata->{serial} = $zone->{serial} + 1;
+		}
+	}
 
 	&zone_update($zone, $metadata)
 		if $metadata;
