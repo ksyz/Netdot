@@ -134,7 +134,7 @@ my $options = GetOptions(
 
 	'ignore-soa!' => \$ignore_soa,
 	'inc-serial' => sub {
-		# could be updated to +/- soem value in the future
+		# could be updated to +/- some value in the future
 		$self{inc_serial} = 1;
 	},
 	'allow-transfer=s' => \@{$acl->{allow_transfer}},
@@ -247,6 +247,7 @@ sub zone_import {
 	&zone_update_acl($zone, $acl)
 		if $acl;
 
+	# we have to define metadata, to trigger update.
 	if ($self{inc_serial}) {
 		if (defined $metadata->{serial}) {
 			$metadata->{serial}++;
@@ -260,9 +261,14 @@ sub zone_import {
 		if $metadata;
 
 	if ($rrs || $self{wipe}) {
-		for ($zone->records) {
-			$logger->debug(sprintf('%s: Deleting RR label %s', $zone_name, $_->name));
-			$_->delete;
+		for my $r ($zone->records) {
+			# for some reason, collection returns Class::DBI::Object::Has::Been::Deleted 
+			# object in set.We cennot filter them out of collection, as referal deletation may 
+			# be triggered by any subsequent delete in thsi loop
+			next
+				if $r->isa('Netdot::Model::RR');
+			$logger->debug(sprintf('%s: Deleting RR label %s', $zone_name, $r->name));
+			$r->delete;
 		}
 
 		$zone->import_records(
