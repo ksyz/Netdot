@@ -266,7 +266,7 @@ sub zone_import {
 			# object in set.We cennot filter them out of collection, as referal deletation may 
 			# be triggered by any subsequent delete in thsi loop
 			next
-				if $r->isa('Netdot::Model::RR');
+				unless $r->isa('Netdot::Model::RR');
 			$logger->debug(sprintf('%s: Deleting RR label %s', $zone_name, $r->name));
 			$r->delete;
 		}
