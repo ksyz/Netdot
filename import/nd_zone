@@ -45,7 +45,7 @@ Usage: $0
 * Zone meta data
 
     -a,-[-no]-active
-    -d,--default-ttl TTL
+    -T,--default-ttl TTL
 
 * SOA data overwite/definition
 
@@ -239,8 +239,7 @@ sub zone_import {
 		}
 	}
 
-
-	# dommy call, to fill-in internal hash from database
+	# dummy call, to fill-in internal hash from database data
 	$zone->get('active');
 
 	# Zone::import cannot set info field
