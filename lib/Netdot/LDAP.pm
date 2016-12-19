@@ -1,6 +1,7 @@
 package Netdot::LDAP;
 use strict;
 use warnings;
+use List::Util "shuffle";
 use Net::LDAP;
 use Net::LDAP::Constant qw(LDAP_EXTENSION_START_TLS);
 use Netdot::AuthLocal;
@@ -165,20 +166,7 @@ sub check_credentials {
 sub _connect {
     my ($r) = @_;
 
-    my (@servers, $server1);
-
-    $server1 = $r->dir_config("NetdotLDAPServer");
-    unless ( $server1 ){
-	$r->log_error("Netdot::LDAP::check_credentials: WARNING: LDAP server is not set. ".
-		      "Set NetdotLDAPServer in httpd.conf");
-	$server1 = "ldaps://localhost";
-    }
-    push @servers, $server1;
-
-    # This is optional
-    if ( my $server2 = $r->dir_config("NetdotLDAPServer") ){
-	push @servers, $server2;
-    }
+    my (@servers, @server_pool, $server1);
 
     my $version = $r->dir_config("NetdotLDAPVersion") || 3;
     my %args = (version=>$version, verify=>'none');
@@ -187,7 +175,33 @@ sub _connect {
 	$args{cafile} = $cafile;
 	$args{verify} = 'require';
     }
-    
+
+	@server_pool = $r->dir_config("NetdotLDAPServerPool");
+	if (@server_pool) {
+		my $ldap = Net::LDAP->new([shuffle @server_pool], %args);
+		if ( $ldap ) {
+			return $ldap;
+		}
+		else {
+			$r->log_error("Netdot::LDAP::check_credentials: ERROR: Could not contact ".
+				  "LDAP servers ".join(', ', @server_pool).": $@");
+		}
+	}
+	else {
+		$server1 = $r->dir_config("NetdotLDAPServer");
+		unless ( $server1 ){
+		$r->log_error("Netdot::LDAP::check_credentials: WARNING: LDAP server is not set. ".
+				  "Set NetdotLDAPServer in httpd.conf");
+		$server1 = "ldaps://localhost";
+		}
+		push @servers, $server1;
+
+		# This is optional
+		if ( my $server2 = $r->dir_config("NetdotLDAPServer2") ){
+		push @servers, $server2;
+		}
+	}
+
     foreach my $server ( @servers ){
 	my $ldap = Net::LDAP->new($server, %args);
 	if ( $ldap ) {
